@@ -1,0 +1,32 @@
+# Requisitos para Censo YOLO + DeepFace + SORT (Python 3.10)
+# Instalación: python -m pip install -r requirements.txt
+
+# Core dependencies
+numpy==1.26.4
+opencv-python==4.12.0.88
+
+# YOLO (Ultralytics)
+ultralytics==8.3.41
+torch==2.0.1
+torchvision==0.15.2
+torchaudio==2.0.2
+
+# DeepFace and facial recognition
+deepface==0.0.96
+retina-face==0.0.17
+mtcnn==1.0.0
+
+# TensorFlow and Keras
+tensorflow==2.20.0
+tf-keras==2.20.1
+keras==3.12.0
+
+# Utilities
+protobuf==4.25.3
+scipy==1.11.4
+scikit-learn==1.3.2
+pillow==10.1.0
+tqdm==4.66.1
+pyyaml==6.0.1
+requests==2.31.0
+filterpy==1.4.2
