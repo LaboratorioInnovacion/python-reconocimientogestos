@@ -1,138 +1,135 @@
 import cv2
 import numpy as np
 import onnxruntime as ort
-from ultralytics import YOLO
-import csv
-import time
-from datetime import datetime
 
-# --------------------------------------------
-# CONFIGURACIÓN DE MODELOS
-# --------------------------------------------
-face_detector = YOLO("models/yolov8n-face.onnx")
-genderage_sess = ort.InferenceSession("models/genderage.onnx", providers=['CPUExecutionProvider'])
+# ================================
+# CONFIG
+# ================================
+FACE_MODEL = "models/yolov8n-face.onnx"
+AGESEX_MODEL = "models/age_gender.onnx"
 
-# --------------------------------------------
-# CSV: CREAR ARCHIVO SI NO EXISTE
-# --------------------------------------------
-csv_file = "detecciones.csv"
-with open(csv_file, "w", newline="", encoding="utf-8") as f:
-    writer = csv.writer(f)
-    writer.writerow(["timestamp", "id", "gender", "age", "x1", "y1", "x2", "y2"])
+FACE_CONF = 0.50
+FACE_IOU = 0.45
+AGESEX_CONF = 0.50
 
+# ================================
+# LOAD MODELS
+# ================================
+face_session = ort.InferenceSession(FACE_MODEL, providers=["CPUExecutionProvider"])
+agesex_session = ort.InferenceSession(AGESEX_MODEL, providers=["CPUExecutionProvider"])
 
-# --------------------------------------------
-# FUNCIÓN: CLASIFICAR GÉNERO Y EDAD
-# --------------------------------------------
-def predict_gender_age(face_img):
-    # Preprocesamiento InsightFace: RGB, 96x96, float32, [0,1]
-    img_r = cv2.resize(face_img, (96, 96))
-    img_rgb = cv2.cvtColor(img_r, cv2.COLOR_BGR2RGB)
-    arr = img_rgb.astype(np.float32) / 255.0
-    arr = np.expand_dims(arr.transpose(2, 0, 1), axis=0)
-    input_name = genderage_sess.get_inputs()[0].name
-    out = genderage_sess.run(None, {input_name: arr})
-    vals = out[0][0]
-    gender = "Hombre" if vals[0] > vals[1] else "Mujer"
-    age = int(max(0, min(vals[2] * 100, 100))) if len(vals) > 2 else -1
-    return gender, age
+# ================================
+# YOLO FACE POSTPROCESS
+# ================================
+def nms(boxes, scores, iou_threshold=0.45):
+    idxs = cv2.dnn.NMSBoxes(boxes, scores, FACE_CONF, iou_threshold)
+    if len(idxs) == 0:
+        return []
+    return [i[0] for i in idxs]
 
 
-# --------------------------------------------
-# CONTADOR + TRACKING SIMPLE
-# --------------------------------------------
-face_id = 0
-last_positions = []
+def postprocess_yolo_face(output, img_w, img_h):
+    detections = []
+    boxes = []
+    scores = []
 
-def is_new_face(x, y):
-    global last_positions
-    for (lx, ly) in last_positions:
-        if abs(x - lx) < 50 and abs(y - ly) < 50:
-            return False
-    last_positions.append((x, y))
-    if len(last_positions) > 50:
-        last_positions.pop(0)
-    return True
+    for det in output[0]:
+        conf = det[4]
+        if conf < FACE_CONF:
+            continue
 
+        x, y, w, h = det[0], det[1], det[2], det[3]
 
-# --------------------------------------------
-# CAPTURA DE CÁMARA
-# --------------------------------------------
+        x1 = int((x - w / 2) * img_w)
+        y1 = int((y - h / 2) * img_h)
+        x2 = int((x + w / 2) * img_w)
+        y2 = int((y + h / 2) * img_h)
+
+        boxes.append([x1, y1, x2 - x1, y2 - y1])
+        scores.append(float(conf))
+
+        detections.append([x1, y1, x2, y2, float(conf)])
+
+    if len(detections) == 0:
+        return []
+
+    keep = nms(boxes, scores, FACE_IOU)
+    return [detections[i] for i in keep]
+
+# ================================
+# AGE + GENDER MODEL
+# ================================
+AGE_BUCKETS = [
+    "0-2","4-6","8-12","15-20",
+    "21-24","25-32","33-43","44-53",
+    "54-63","65+"
+]
+
+def predict_age_sex(face_img):
+    blob = cv2.resize(face_img, (224, 224))
+    blob = blob.astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[None, :, :, :]
+
+    outputs = agesex_session.run(None, {"input": blob})
+
+    gender_logits = outputs[0][0]
+    age_logits = outputs[1][0]
+
+    gender = np.argmax(gender_logits)  # 0=female, 1=male
+    age = np.argmax(age_logits)
+
+    gender_text = "Hombre" if gender == 1 else "Mujer"
+    age_text = AGE_BUCKETS[age]
+
+    score = float(max(gender_logits.max(), age_logits.max()) * 100)
+
+    return gender_text, age_text, score
+
+# ================================
+# MAIN LOOP
+# ================================
 cap = cv2.VideoCapture(0)
+print("🔵 Iniciando detección...")
 
-if not cap.isOpened():
-    print("❌ No se pudo acceder a la webcam")
-    exit()
+face_id = 0
 
-print("📹 Cámara iniciada. Presiona Q para salir.")
-prev_time = time.time()
-
-
-# --------------------------------------------
-# LOOP PRINCIPAL
-# --------------------------------------------
 while True:
     ret, frame = cap.read()
     if not ret:
         break
 
-    # FPS
-    current_time = time.time()
-    fps = 1 / (current_time - prev_time)
-    prev_time = current_time
+    h, w = frame.shape[:2]
 
-    results = face_detector(frame, verbose=False)
+    # PREPROCESS YOLO
+    img = cv2.resize(frame, (640, 640))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    blob = img_rgb.astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[None, :, :, :]
 
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+    outputs = face_session.run(None, {"images": blob})
+    faces = postprocess_yolo_face(outputs, w, h)
 
-            x1 = max(0, x1); y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
+    for (x1, y1, x2, y2, conf) in faces:
+        face_id += 1
 
-            face = frame[y1:y2, x1:x2]
+        # recorte
+        face_crop = frame[max(0, y1):y2, max(0, x1):x2]
 
-            if face.size == 0:
-                continue
+        if face_crop.size == 0:
+            continue
 
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+        gender, age, score = predict_age_sex(face_crop)
 
-            # Nuevo rostro → asignar ID
-            if is_new_face(cx, cy):
-                face_id += 1
+        # LOG REAL LIMPIO
+        print(f"[ID {face_id}] {gender} - {age} - Score {score:.2f}")
 
-                # Guardar en CSV
-                with open(csv_file, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        face_id,
-                        "-", "-",  # luego se completa con predicción
-                        x1, y1, x2, y2
-                    ])
+        # Draw
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, f"{gender}, {age}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            # Predicción de género + edad
-            gender, age = predict_gender_age(face)
-
-            # Logging en consola
-            print(f"[ID {face_id}] {gender}, {age} años – Caja: {x1},{y1},{x2},{y2}")
-
-            # Dibujar rectángulo + texto
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
-            cv2.putText(frame, f"{gender}, {age}", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-
-    # Mostrar FPS
-    cv2.putText(frame, f"FPS: {fps:.1f}", (20, 80),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 3)
-
-    # Mostrar ventana
-    cv2.imshow("YOLO FACE + Edad/Género + FPS", frame)
-
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    cv2.imshow("Deteccion Facial YOLO", frame)
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
 cap.release()
