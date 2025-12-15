@@ -2,6 +2,11 @@ import cv2
 from deepface import DeepFace
 import threading
 import time
+import os
+import glob
+import numpy as np
+import json
+
 
 class FaceAnalyzer:
     def __init__(self):
@@ -10,139 +15,293 @@ class FaceAnalyzer:
         self.analyzing = False
         self.last_analysis_time = 0
         self.analysis_interval = 1.0  # Analizar cada 1 segundo
-        
+
+        self.faces_dir = 'rostros_registrados'
+        os.makedirs(self.faces_dir, exist_ok=True)
+
+        # Cargar embeddings existentes
+        self.person_embeddings = []
+        for npy in glob.glob(os.path.join(self.faces_dir, 'face_*.npy')):
+            try:
+                emb = np.load(npy)
+                self.person_embeddings.append(emb)
+            except Exception:
+                pass
+
+        # Parámetros
+        self.min_sharpness = 40.0
+        self.min_brightness = 40
+        self.max_brightness = 220
+        self.save_consecutive_required = 6
+        self.save_time_window = 8.0  # segundos
+
+        # Embedding thresholds
+        self.use_cosine = True
+        self.embedding_cosine_thresh = 0.28
+        self.candidate_cosine_thresh = 0.22
+        self.embedding_threshold = 3.8
+        self.candidate_similarity_thresh = 2.5
+        self.candidate_iou_thresh = 0.6
+
+        # Verbosity control
+        self.verbose = False
+
+        # Tracker simple
+        self.tracks = {}  # id -> {bbox, last_seen, count, embedding, saved}
+        self.next_track_id = 1
+        self.track_max_age = 4.0
+
+    def _iou(self, boxA, boxB):
+        if boxA is None or boxB is None:
+            return 0.0
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+        interW = max(0, xB - xA)
+        interH = max(0, yB - yA)
+        interArea = interW * interH
+        boxAArea = boxA[2] * boxA[3]
+        boxBArea = boxB[2] * boxB[3]
+        denom = float(boxAArea + boxBArea - interArea)
+        if denom == 0:
+            return 0.0
+        return interArea / denom
+
+    def _cosine_distance(self, a, b):
+        a = np.array(a)
+        b = np.array(b)
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 1.0
+        return 1.0 - (np.dot(a, b) / (na * nb))
+
     def analyze_face(self, frame):
-        """Analiza un frame en un hilo separado"""
+        """Analiza un frame y, si corresponde, guarda un rostro único en disco."""
         try:
-            # Usar modelo ligero para mejor rendimiento en CPU
             results = DeepFace.analyze(
-                frame, 
+                frame,
                 actions=['age', 'gender', 'emotion'],
                 enforce_detection=False,
-                detector_backend='opencv',  # Más rápido en CPU
-                silent=True
+                detector_backend='opencv',
+                silent=True,
             )
-            
-            # DeepFace puede retornar lista o dict
             if isinstance(results, list):
                 self.analysis_result = results[0] if results else {}
             else:
                 self.analysis_result = results
-                
-        except Exception as e:
-            print(f"Error en análisis: {e}")
-            self.analysis_result = {}
-        finally:
-            self.analyzing = False
-    
-    def draw_results(self, frame, face_locations):
-        """Dibuja los resultados en el frame"""
-        for (x, y, w, h) in face_locations:
-            # Dibujar rectángulo alrededor del rostro
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            
-            if self.analysis_result:
-                # Preparar texto
-                edad = self.analysis_result.get('age', 'N/A')
-                genero = self.analysis_result.get('dominant_gender', 'N/A')
-                emocion = self.analysis_result.get('dominant_emotion', 'N/A')
-                
-                # Traducir género
-                genero_es = 'Hombre' if genero == 'Man' else 'Mujer' if genero == 'Woman' else genero
-                
-                # Emociones en español
-                emociones_es = {
-                    'angry': 'Enojado/a',
-                    'disgust': 'Disgusto',
-                    'fear': 'Miedo',
-                    'happy': 'Feliz',
-                    'sad': 'Triste',
-                    'surprise': 'Sorprendido/a',
-                    'neutral': 'Neutral'
+
+            faces = results if isinstance(results, list) else [results]
+            if not faces:
+                return
+
+            # Seleccionar rostro más grande
+            face = max(
+                faces,
+                key=lambda f: f.get('region', {}).get('w', 0) * f.get('region', {}).get('h', 0),
+            )
+            region = face.get('region', {})
+            x, y, w, h = (
+                region.get('x', 0),
+                region.get('y', 0),
+                region.get('w', 0),
+                region.get('h', 0),
+            )
+            if w <= 0 or h <= 0:
+                return
+
+            face_img = frame[y : y + h, x : x + w]
+            if face_img.size == 0:
+                return
+
+            face_img_resized = cv2.resize(face_img, (160, 160))
+
+            # Calidad
+            gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            sharpness = cv2.Laplacian(gray_face, cv2.CV_64F).var()
+            brightness = int(gray_face.mean())
+            if sharpness < self.min_sharpness or not (
+                self.min_brightness <= brightness <= self.max_brightness
+            ):
+                print(f"Rostro descartado por calidad (sharp={sharpness:.1f}, bright={brightness})")
+                return
+
+            # Obtener embedding
+            try:
+                rep = DeepFace.represent(
+                    face_img_resized, model_name='Facenet', enforce_detection=False, detector_backend='opencv'
+                )
+                embedding = rep[0]['embedding'] if isinstance(rep, list) and rep else rep['embedding']
+            except Exception as e:
+                print(f"Error obteniendo embedding: {e}")
+                return
+
+            # Comparar con person_embeddings
+            is_duplicate = False
+            for emb_reg in self.person_embeddings:
+                try:
+                    if self.use_cosine:
+                        dist = self._cosine_distance(embedding, emb_reg)
+                        if dist < self.embedding_cosine_thresh:
+                            is_duplicate = True
+                            break
+                    else:
+                        dist = np.linalg.norm(np.array(embedding) - emb_reg)
+                        if dist < self.embedding_threshold:
+                            is_duplicate = True
+                            break
+                except Exception:
+                    continue
+
+            if is_duplicate:
+                if self.verbose:
+                    print("Rostro ya registrado (duplicado)")
+                return
+
+            # Tracker: asignar a track existente por IoU o crear nuevo
+            current_time = time.time()
+            current_bbox = (x, y, w, h)
+            # limpiar tracks viejos
+            for tid in list(self.tracks.keys()):
+                if current_time - self.tracks[tid]['last_seen'] > self.track_max_age:
+                    del self.tracks[tid]
+
+            best_id = None
+            best_iou = 0.0
+            for tid, tr in self.tracks.items():
+                try:
+                    i = self._iou(tr['bbox'], current_bbox)
+                except Exception:
+                    i = 0.0
+                if i > best_iou:
+                    best_iou = i
+                    best_id = tid
+
+            if best_id is not None and best_iou >= self.candidate_iou_thresh:
+                tr = self.tracks[best_id]
+                tr['last_seen'] = current_time
+                tr['bbox'] = current_bbox
+                # comparar embeddings
+                if self.use_cosine:
+                    cd_dist = self._cosine_distance(embedding, tr['embedding'])
+                    similar = cd_dist < self.candidate_cosine_thresh
+                else:
+                    cd_dist = np.linalg.norm(np.array(embedding) - tr['embedding'])
+                    similar = cd_dist < self.candidate_similarity_thresh
+                if similar:
+                    tr['count'] += 1
+                    tr['embedding'] = (
+                        np.array(tr['embedding']) * (tr['count'] - 1) + np.array(embedding)
+                    ) / tr['count']
+                    print(
+                        f"Track {best_id} incrementado ({tr['count']}), iou={best_iou:.2f}, cd_dist={cd_dist:.2f}"
+                    )
+                else:
+                    tr['embedding'] = embedding
+                    tr['count'] = 1
+                    print(f"Track {best_id} reiniciado (embedding diferente), cd_dist={cd_dist:.2f}")
+                track_ref = tr
+            else:
+                tid = self.next_track_id
+                self.next_track_id += 1
+                self.tracks[tid] = {
+                    'bbox': current_bbox,
+                    'last_seen': current_time,
+                    'count': 1,
+                    'embedding': embedding,
+                    'saved': False,
                 }
-                emocion_es = emociones_es.get(emocion, emocion)
-                
-                # Mostrar información
-                y_offset = y - 10
-                cv2.putText(frame, f'Edad: {int(edad)}', (x, y_offset), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f'Genero: {genero_es}', (x, y_offset - 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f'Emocion: {emocion_es}', (x, y_offset - 50), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
+                track_ref = self.tracks[tid]
+                print(f"Nuevo track {tid} iniciado")
+
+            # Guardar si el track alcanzó el mínimo requerido
+            if track_ref.get('count', 0) >= self.save_consecutive_required and not track_ref.get('saved', False):
+                timestamp = int(time.time() * 1000)
+                filename = f"face_{timestamp}.jpg"
+                filepath = os.path.join(self.faces_dir, filename)
+                cv2.imwrite(filepath, face_img)
+                np.save(filepath.replace('.jpg', '.npy'), np.array(track_ref['embedding']))
+                datos = {
+                    'edad': face.get('age', None),
+                    'genero': face.get('dominant_gender', None),
+                    'emocion': face.get('dominant_emotion', None),
+                }
+                with open(filepath.replace('.jpg', '.json'), 'w', encoding='utf-8') as f:
+                    json.dump(datos, f, ensure_ascii=False, indent=2)
+                print(f"Rostro único guardado para track tras {track_ref['count']} apariciones: {filename} y datos")
+                track_ref['saved'] = True
+                try:
+                    self.person_embeddings.append(np.array(track_ref['embedding']))
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"Error en analyze_face: {e}")
+        finally:
+            # permitir nuevos análisis
+            self.analyzing = False
+
+    def draw_results(self, frame, face_locations):
+        """Dibuja los resultados en el frame y retorna el frame modificado"""
+        for (x, y, w, h) in face_locations:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        if self.analysis_result:
+            edad = self.analysis_result.get('age', 'N/A')
+            genero = self.analysis_result.get('dominant_gender', 'N/A')
+            emocion = self.analysis_result.get('dominant_emotion', 'N/A')
+            genero_es = 'Hombre' if genero == 'Man' else 'Mujer' if genero == 'Woman' else genero
+            text = f"Edad: {edad}  Género: {genero_es}  Emoción: {emocion}"
+            cv2.putText(frame, text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return frame
-    
+
     def run(self, camera_index=0):
-        """Ejecuta la aplicación"""
-        print("Iniciando aplicación de reconocimiento facial...")
-        print("Presiona 'q' para salir")
-        
-        # Inicializar cámara
         self.cap = cv2.VideoCapture(camera_index)
-        
-        # Optimizar para mejor rendimiento
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        # Ajustes básicos
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
+
         if not self.cap.isOpened():
             print("Error: No se pudo abrir la cámara")
             return
-        
+
         # Cargar detector de rostros de OpenCV
         face_cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
         )
-        
+
         print("Aplicación iniciada correctamente!")
-        
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
                 print("Error al leer frame")
                 break
-            
-            # Convertir a escala de grises para detección
+
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Detectar rostros
+
             faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1, 
-                minNeighbors=5, 
-                minSize=(60, 60)
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
             )
-            
-            # Analizar solo si hay rostros y no estamos analizando
+
             current_time = time.time()
             if len(faces) > 0 and not self.analyzing:
                 if current_time - self.last_analysis_time > self.analysis_interval:
                     self.analyzing = True
                     self.last_analysis_time = current_time
-                    # Analizar en hilo separado para no bloquear video
-                    threading.Thread(
-                        target=self.analyze_face, 
-                        args=(frame.copy(),), 
-                        daemon=True
-                    ).start()
-            
-            # Dibujar resultados
+                    threading.Thread(target=self.analyze_face, args=(frame.copy(),), daemon=True).start()
+
             frame = self.draw_results(frame, faces)
-            
-            # Mostrar FPS
+
             fps_text = f'Rostros detectados: {len(faces)}'
-            cv2.putText(frame, fps_text, (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
-            # Mostrar frame
+            cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
             cv2.imshow('Reconocimiento Facial - Presiona Q para salir', frame)
-            
-            # Salir con 'q'
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        
-        # Limpiar
+
         self.cap.release()
         cv2.destroyAllWindows()
         print("Aplicación cerrada")
@@ -154,10 +313,8 @@ if __name__ == "__main__":
     print("Detecta: Rostros, Edad, Género y Emociones")
     print("=" * 50)
     print()
-    
+
     analyzer = FaceAnalyzer()
-    
-    # Cambiar el 0 por otro número si tienes múltiples cámaras
     analyzer.run(camera_index=0)
 # """
 # Aplicación Web de Detección Facial con Edad y Género
@@ -687,44 +844,48 @@ if __name__ == "__main__":
 # # # import time
 
 # # # class FaceDetector:
-# # #     def __init__(self):
-# # #         self.frame_skip = 3  # Procesar cada 3 frames para mejor rendimiento
-# # #         self.frame_count = 0
-# # #         self.last_analysis = {}
-        
-# # #     def analyze_frame(self, frame):
-# # #         """Analiza un frame y retorna información facial"""
-# # #         try:
-# # #             # Análisis con DeepFace
-# # #             results = DeepFace.analyze(
-# # #                 frame,
-# # #                 actions=['age', 'gender', 'emotion'],
-# # #                 enforce_detection=False,
-# # #                 detector_backend='opencv',  # Más rápido en CPU
-# # #                 silent=True
-# # #             )
-            
-# # #             # DeepFace puede retornar lista o dict
-# # #             if isinstance(results, list):
-# # #                 return results
-# # #             else:
-# # #                 return [results]
-                
-# # #         except Exception as e:
-# # #             print(f"Error en análisis: {e}")
-# # #             return []
-    
-# # #     def draw_info(self, frame, analysis_results):
-# # #         """Dibuja la información en el frame"""
-# # #         for result in analysis_results:
-# # #             # Obtener región facial
-# # #             region = result.get('region', {})
-# # #             x = region.get('x', 0)
-# # #             y = region.get('y', 0)
-# # #             w = region.get('w', 100)
-# # #             h = region.get('h', 100)
-            
-# # #             # Dibujar rectángulo alrededor del rostro
+    def __init__(self):
+        self.cap = None
+        self.analysis_result = {}
+        self.analyzing = False
+        self.last_analysis_time = 0
+        self.analysis_interval = 1.0  # Analizar cada 1 segundo
+        self.embeddings = []  # Lista de embeddings únicos (por compatibilidad)
+        self.faces_dir = 'rostros_registrados'
+        import os
+        import glob
+        import numpy as np
+        os.makedirs(self.faces_dir, exist_ok=True)
+        # Cargar embeddings existentes en memoria como lista de personas
+        self.person_embeddings = []
+        for npy in glob.glob(os.path.join(self.faces_dir, 'face_*.npy')):
+            try:
+                emb = np.load(npy)
+                self.person_embeddings.append(emb)
+            except Exception:
+                pass
+        # Mecanismo de candidato para evitar guardar inmediatamente
+        self.candidate_embedding = None
+        self.candidate_count = 0
+        self.candidate_first_seen = 0
+        self.prev_bbox = None
+        # Parámetros de calidad y umbrales (ajustables)
+        self.min_sharpness = 40.0
+        self.min_brightness = 40
+        self.max_brightness = 220
+        self.save_consecutive_required = 4
+        self.save_time_window = 8.0  # segundos
+        self.embedding_threshold = 3.8
+        self.candidate_similarity_thresh = 2.5
+        self.candidate_iou_thresh = 0.6
+        # Preferir similaridad coseno sobre L2 (más estable ante variaciones)
+        self.use_cosine = True
+        self.embedding_cosine_thresh = 0.30
+        self.candidate_cosine_thresh = 0.25
+        # Tracker simple por ID (centroid/IoU)
+        self.tracks = {}  # id -> {bbox, last_seen, count, embedding, saved}
+        self.next_track_id = 1
+        self.track_max_age = 4.0
 # # #             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
 # # #             # Extraer información
