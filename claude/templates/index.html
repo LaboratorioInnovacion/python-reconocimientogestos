@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detector Facial - Edad y Género</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .main-content {
+            padding: 30px;
+        }
+        
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        #videoFeed {
+            width: 100%;
+            display: block;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-bottom: 30px;
+        }
+        
+        button {
+            padding: 15px 30px;
+            font-size: 1em;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        
+        .btn-start {
+            background: #10b981;
+            color: white;
+        }
+        
+        .btn-stop {
+            background: #ef4444;
+            color: white;
+        }
+        
+        .btn-capture {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        
+        .stat-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        
+        .stat-label {
+            font-size: 1em;
+            opacity: 0.9;
+        }
+        
+        .message {
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+            display: none;
+        }
+        
+        .message.success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 2px solid #10b981;
+        }
+        
+        .message.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 2px solid #ef4444;
+        }
+        
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 1.8em;
+            }
+            
+            .controls {
+                flex-direction: column;
+            }
+            
+            button {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎭 Detector Facial</h1>
+            <p class="subtitle">Reconocimiento de Edad y Género en Tiempo Real</p>
+        </header>
+        
+        <div class="main-content">
+            <div id="message" class="message"></div>
+            
+            <div class="video-container">
+                <img id="videoFeed" src="/video_feed" alt="Video Feed">
+            </div>
+            
+            <div class="controls">
+                <button class="btn-start" onclick="startCamera()">▶️ Iniciar Cámara</button>
+                <button class="btn-stop" onclick="stopCamera()">⏹️ Detener</button>
+                <button class="btn-capture" onclick="capture()">📸 Capturar</button>
+            </div>
+            
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Rostros Detectados</div>
+                    <div class="stat-value" id="totalFaces">0</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Detecciones</div>
+                    <div class="stat-value" id="totalDetections">0</div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function showMessage(text, type) {
+            const msg = document.getElementById('message');
+            msg.textContent = text;
+            msg.className = `message ${type}`;
+            msg.style.display = 'block';
+            setTimeout(() => {
+                msg.style.display = 'none';
+            }, 3000);
+        }
+        
+        async function startCamera() {
+            try {
+                const response = await fetch('/start_camera', { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    showMessage('✅ Cámara iniciada correctamente', 'success');
+                    updateStats();
+                } else {
+                    showMessage('❌ Error: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showMessage('❌ Error al iniciar cámara', 'error');
+            }
+        }
+        
+        async function stopCamera() {
+            try {
+                const response = await fetch('/stop_camera', { method: 'POST' });
+                const data = await response.json();
+                showMessage('⏹️ Cámara detenida', 'success');
+            } catch (error) {
+                showMessage('❌ Error al detener cámara', 'error');
+            }
+        }
+        
+        async function capture() {
+            try {
+                const response = await fetch('/capture', { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    showMessage(`📸 Captura guardada: ${data.filename}`, 'success');
+                } else {
+                    showMessage('❌ No hay frame para capturar', 'error');
+                }
+            } catch (error) {
+                showMessage('❌ Error al capturar', 'error');
+            }
+        }
+        
+        async function updateStats() {
+            try {
+                const response = await fetch('/stats');
+                const stats = await response.json();
+                document.getElementById('totalFaces').textContent = stats.total_faces;
+                document.getElementById('totalDetections').textContent = stats.detections.length;
+            } catch (error) {
+                console.error('Error updating stats:', error);
+            }
+        }
+        
+        // Actualizar estadísticas cada 2 segundos
+        setInterval(updateStats, 2000);
+    </script>
+</body>
+</html>
