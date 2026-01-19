@@ -1,7 +1,10 @@
 import cv2
 import os
 import json
+import time
 import numpy as np
+import signal
+import sys
 from deepface import DeepFace
 from datetime import datetime
 
@@ -36,16 +39,77 @@ cap = cv2.VideoCapture(RTSP_URL)
 
 if not cap.isOpened():
     print("❌ No se pudo abrir el stream")
-    exit()
+    # Intentar reconectar unas veces antes de salir
+    retries = 0
+    while retries < 5 and not cap.isOpened():
+        time.sleep(2)
+        cap = cv2.VideoCapture(RTSP_URL)
+        retries += 1
+    if not cap.isOpened():
+        print("❌ No se pudo abrir el stream tras varios reintentos. Abortando.")
+        sys.exit(1)
 
 print("✅ Stream conectado")
 
 frame_count = 0
 
+def save_people():
+    # Guardar JSON sin embeddings (no serializables)
+    try:
+        dump_list = []
+        for p in people:
+            copy_p = p.copy()
+            if "embedding" in copy_p:
+                del copy_p["embedding"]
+            dump_list.append(copy_p)
+        with open(JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump(dump_list, f, indent=2, ensure_ascii=False)
+        print(f"\n📄 Archivo actualizado: {JSON_FILE}")
+    except Exception as e:
+        print(f"Error guardando JSON: {e}")
+
+
+def try_reconnect(max_attempts=10, delay=2):
+    print("⚠️  Conexión perdida. Intentando reconectar...")
+    cap.release()
+    attempts = 0
+    while attempts < max_attempts:
+        time.sleep(delay)
+        new_cap = cv2.VideoCapture(RTSP_URL)
+        if new_cap.isOpened():
+            print("🔁 Reconectado al stream")
+            return new_cap
+        attempts += 1
+        print(f"  intento {attempts}/{max_attempts}...")
+    print("❌ No se pudo reconectar después de varios intentos.")
+    return None
+
+
+def handle_exit(signum, frame):
+    print("\n🏁 Señal de salida recibida, guardando y cerrando...")
+    save_people()
+    try:
+        cap.release()
+    except:
+        pass
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, handle_exit)
+signal.signal(signal.SIGTERM, handle_exit)
+
 while True:
     ret, frame = cap.read()
     if not ret:
-        break
+        # intentar reconectar
+        new_cap = try_reconnect()
+        if new_cap is None:
+            break
+        cap = new_cap
+        ret, frame = cap.read()
+        if not ret:
+            # si sigue fallando, salir
+            break
 
     frame_count += 1
     if frame_count % FRAME_SKIP != 0:
@@ -101,17 +165,15 @@ while True:
                 "embedding": embedding,
                 "image": img_path
             })
+            # guardar inmediatamente al detectar nueva persona
+            save_people()
 
-    print(f"👥 Personas detectadas: {len(people)}", end="\r")
+    print(f"👥 Personas detectadas: {len(people)}")
 
-cap.release()
+    cap.release()
 
-# Guardar JSON
-for p in people:
-    del p["embedding"]
+    # Guardar JSON final
+    save_people()
 
-with open(JSON_FILE, "w", encoding="utf-8") as f:
-    json.dump(people, f, indent=2, ensure_ascii=False)
-
-print("\n✅ Proceso finalizado")
-print(f"📄 Archivo generado: {JSON_FILE}")
+    print("\n✅ Proceso finalizado")
+    print(f"📄 Archivo generado: {JSON_FILE}")
